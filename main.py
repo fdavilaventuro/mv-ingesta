@@ -82,7 +82,30 @@ def send_data_to_ms(ms_name, csv_path):
     with open(csv_path, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = {executor.submit(post_with_retries, endpoint, row): row for row in reader}
+            futures = {}
+            for row in reader:
+                # ---------- Ajustes de tipo para evitar 422 ----------
+                if ms_name == "cursos":
+                    # duracion_min debe ser integer
+                    if 'duracion_min' in row:
+                        try:
+                            row['duracion_min'] = int(row['duracion_min'])
+                        except ValueError:
+                            row['duracion_min'] = 0  # fallback si hay error
+
+                    # instructor_ids debe ser array de integers
+                    if 'instructor_ids' in row:
+                        # si viene como string separado por comas
+                        if isinstance(row['instructor_ids'], str):
+                            row['instructor_ids'] = [int(i.strip()) for i in row['instructor_ids'].split(',') if i.strip().isdigit()]
+                        elif isinstance(row['instructor_ids'], int):
+                            row['instructor_ids'] = [row['instructor_ids']]
+                        elif isinstance(row['instructor_ids'], list):
+                            row['instructor_ids'] = [int(i) for i in row['instructor_ids']]
+                # -------------------------------------------------------
+
+                futures[executor.submit(post_with_retries, endpoint, row)] = row
+
             for future in as_completed(futures):
                 result = future.result()
                 if result:
