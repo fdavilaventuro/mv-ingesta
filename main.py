@@ -19,7 +19,7 @@ LOG_FILE = "/tmp/ingesta.log"
 BATCH_SIZE = 500
 # -----------------------------------------------
 
-# Configuración de logging
+# Logging
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
@@ -35,7 +35,7 @@ MS_ENDPOINTS = {
 }
 
 CSV_FILES = {
-    "students": "estudiantes.csv",
+    "students": "estudiantes.csv",   # corregido
     "instructores": "instructores.csv",
     "cursos": "cursos.csv",
 }
@@ -44,11 +44,6 @@ LOCAL_DIR = "/tmp/ingesta_data"
 os.makedirs(LOCAL_DIR, exist_ok=True)
 
 s3 = boto3.client("s3", region_name=REGION_NAME)
-
-# ---------- IDs generados ----------
-STUDENTS_IDS = []
-INSTRUCTORES_IDS = {}
-CURSOS_IDS = []
 
 # ---------- FUNCIONES ----------
 
@@ -76,6 +71,20 @@ def post_with_retries(url, json_data):
         time.sleep(0.5 * (attempt + 1))
     return None
 
+def patch_with_retries(url, json_data):
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.patch(url, json=json_data, timeout=5)
+            if response.status_code in [200, 201]:
+                logging.info(f"PATCH exitoso: {json_data} en {url}")
+                return response.json()
+            else:
+                logging.warning(f"Error {response.status_code} en PATCH: {json_data}")
+        except Exception as e:
+            logging.error(f"Falló PATCH: {json_data} | Error: {e}")
+        time.sleep(0.5 * (attempt + 1))
+    return None
+
 def send_data_to_ms(ms_name, csv_path):
     endpoint = MS_ENDPOINTS[ms_name]
     logging.info(f"Iniciando ingesta para {ms_name} ({endpoint})")
@@ -92,55 +101,67 @@ def send_data_to_ms(ms_name, csv_path):
                             row['duracion_min'] = int(row['duracion_min'])
                         except ValueError:
                             row['duracion_min'] = 0
-
                     if 'instructor_ids' in row:
-                        # Remplazar instructor_ids por los IDs reales
                         instr = row['instructor_ids']
                         instr_list = []
                         if isinstance(instr, str):
                             for name in instr.split(','):
                                 name = name.strip()
-                                if name in INSTRUCTORES_IDS:
-                                    instr_list.append(INSTRUCTORES_IDS[name])
+                                instr_list.append(name)  # dejar tal cual, se puede patch luego
                         row['instructor_ids'] = instr_list
-
                 futures[executor.submit(post_with_retries, endpoint, row)] = row
 
+            # Esperar a todos
             for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    if ms_name == "students":
-                        STUDENTS_IDS.append(result.get("id"))
-                    elif ms_name == "instructores":
-                        # Guardamos mapping nombre → id
-                        key = row.get("nombre") or f"id_{len(INSTRUCTORES_IDS)+1}"
-                        INSTRUCTORES_IDS[key] = result.get("id")
-                    elif ms_name == "cursos":
-                        CURSOS_IDS.append(result.get("id"))
+                future.result()
 
-def generate_inscripcion():
-    estudiante_id = random.choice(STUDENTS_IDS)
-    curso_id = random.choice(CURSOS_IDS)
-    estado = random.choice(["activa", "completada", "cancelada"])
-    metodo_pago = random.choice(["tarjeta", "paypal", "transferencia"])
-    monto = round(random.uniform(50, 500), 2)
-    total_lecciones = random.randint(5, 20)
-    lecciones_completadas = random.sample(range(1, total_lecciones+1), random.randint(0, total_lecciones))
-    progreso = {
-        "porcentaje": round(len(lecciones_completadas)/total_lecciones*100, 2),
-        "leccionesCompletadas": lecciones_completadas,
-        "ultimaLeccionId": max(lecciones_completadas) if lecciones_completadas else 0
-    }
-    fecha_inscripcion = (datetime.now() - timedelta(days=random.randint(0, 365))).isoformat()
-    return {
-        "estudianteId": estudiante_id,
-        "cursoId": curso_id,
-        "estado": estado,
-        "metodoPago": metodo_pago,
-        "monto": monto,
-        "progreso": progreso,
-        "fechaInscripcion": fecha_inscripcion
-    }
+# ---------- INSCRIPCIONES ----------
+
+def fetch_student_ids():
+    """Obtiene IDs de estudiantes paginados desde el microservicio"""
+    student_ids = []
+    page = 0
+    size = 100
+    while True:
+        try:
+            resp = requests.get(f"{MS_ENDPOINTS['students']}?page={page}&size={size}", timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("content", [])
+            student_ids.extend([s["id"] for s in content])
+            if data.get("last", True):
+                break
+            page += 1
+        except Exception as e:
+            logging.error(f"No se pudo obtener estudiantes: {e}")
+            break
+    logging.info(f"Total estudiantes obtenidos: {len(student_ids)}")
+    return student_ids
+
+def generate_inscripcion(student_ids, n_inscripciones=20000):
+    for _ in range(n_inscripciones):
+        estudiante_id = random.choice(student_ids)
+        curso_id = random.randint(1, 20000)  # curso aleatorio
+        estado = random.choice(["activa", "completada", "cancelada"])
+        metodo_pago = random.choice(["tarjeta", "paypal", "transferencia"])
+        monto = round(random.uniform(50, 500), 2)
+        total_lecciones = random.randint(5, 20)
+        lecciones_completadas = random.sample(range(1, total_lecciones+1), random.randint(0, total_lecciones))
+        progreso = {
+            "porcentaje": round(len(lecciones_completadas)/total_lecciones*100, 2),
+            "leccionesCompletadas": lecciones_completadas,
+            "ultimaLeccionId": max(lecciones_completadas) if lecciones_completadas else 0
+        }
+        fecha_inscripcion = (datetime.now() - timedelta(days=random.randint(0, 365))).isoformat()
+        yield {
+            "estudianteId": estudiante_id,
+            "cursoId": curso_id,
+            "estado": estado,
+            "metodoPago": metodo_pago,
+            "monto": monto,
+            "progreso": progreso,
+            "fechaInscripcion": fecha_inscripcion
+        }
 
 def print_progress(current, total, prefix='Progreso'):
     percent = current / total * 100
@@ -152,24 +173,35 @@ def print_progress(current, total, prefix='Progreso'):
     if current == total:
         print()
 
-def generate_and_send_inscripciones(n_inscripciones=20000):
-    if not STUDENTS_IDS or not CURSOS_IDS:
-        logging.warning("No hay estudiantes o cursos válidos para generar inscripciones")
+def generate_and_send_inscripciones():
+    student_ids = fetch_student_ids()
+    if not student_ids:
+        logging.warning("No hay estudiantes en la base para generar inscripciones")
         return
+    n_inscripciones = 20000
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = []
+        for i, insc in enumerate(generate_inscripcion(student_ids, n_inscripciones), 1):
+            futures.append(executor.submit(post_with_retries, MS_ENDPOINTS["inscripciones"], insc))
+            if i % BATCH_SIZE == 0:
+                print_progress(i, n_inscripciones, prefix="Ingesta de inscripciones")
+        for future in as_completed(futures):
+            future.result()
+    print_progress(n_inscripciones, n_inscripciones, prefix="Ingesta de inscripciones")
 
-    logging.info(f"Generando y enviando {n_inscripciones} inscripciones en batches de {BATCH_SIZE}")
-    total_batches = math.ceil(n_inscripciones / BATCH_SIZE)
+# ---------- PATCH cursos ----------
 
-    for batch_num in range(total_batches):
-        current_batch_size = min(BATCH_SIZE, n_inscripciones - batch_num * BATCH_SIZE)
-        batch = [generate_inscripcion() for _ in range(current_batch_size)]
+def patch_cursos_random_instructor():
+    # Obtener todos los cursos existentes
+    cursos_resp = requests.get(MS_ENDPOINTS["cursos"] + "?page=0&size=20000", timeout=5)
+    cursos_resp.raise_for_status()
+    cursos = cursos_resp.json().get("content", [])
 
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = [executor.submit(post_with_retries, MS_ENDPOINTS["inscripciones"], insc) for insc in batch]
-            for future in as_completed(futures):
-                future.result()
-
-        print_progress(batch_num + 1, total_batches, prefix='Ingesta de inscripciones')
+    logging.info(f"Total cursos a patch: {len(cursos)}")
+    for curso in cursos:
+        curso_id = curso["id"]
+        instructor_id = random.randint(1, 20000)
+        patch_with_retries(f"{MS_ENDPOINTS['cursos']}/{curso_id}", {"instructor_ids": [instructor_id]})
 
 # ---------- MAIN ----------
 
@@ -177,7 +209,6 @@ def main():
     logging.info("===== INICIO DE INGESTA =====")
     download_csvs()
 
-    # ---------- ORDEN CORRECTO ----------
     for ms in ["students", "instructores", "cursos"]:
         filename = CSV_FILES[ms]
         local_path = os.path.join(LOCAL_DIR, filename)
@@ -186,7 +217,12 @@ def main():
         else:
             logging.warning(f"Saltando {ms}: {filename} no encontrado")
 
+    # Generar inscripciones usando IDs de DB y curso aleatorio
     generate_and_send_inscripciones()
+
+    # Patch cursos con instructor_id aleatorio
+    patch_cursos_random_instructor()
+
     logging.info("===== INGESTA FINALIZADA =====")
     print("\n✅ Ingesta completada. Logs en:", LOG_FILE)
 
