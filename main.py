@@ -11,7 +11,7 @@ import math
 import sys
 
 # ---------------- CONFIGURACIÓN ----------------
-BUCKET_NAME = "ingesta-microservicios-2025"  # ⚠️ reemplaza con tu bucket real
+BUCKET_NAME = "ingesta-microservicios-2025"
 REGION_NAME = "us-east-1"
 MAX_THREADS = 10
 MAX_RETRIES = 3
@@ -36,8 +36,8 @@ MS_ENDPOINTS = {
 
 CSV_FILES = {
     "students": "students.csv",
-    "cursos": "cursos.csv",
     "instructores": "instructores.csv",
+    "cursos": "cursos.csv",
 }
 
 LOCAL_DIR = "/tmp/ingesta_data"
@@ -45,8 +45,9 @@ os.makedirs(LOCAL_DIR, exist_ok=True)
 
 s3 = boto3.client("s3", region_name=REGION_NAME)
 
-# IDs retornados
+# ---------- IDs generados ----------
 STUDENTS_IDS = []
+INSTRUCTORES_IDS = {}
 CURSOS_IDS = []
 
 # ---------- FUNCIONES ----------
@@ -84,25 +85,24 @@ def send_data_to_ms(ms_name, csv_path):
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = {}
             for row in reader:
-                # ---------- Ajustes de tipo para evitar 422 ----------
+                # ---------- Ajustes de tipo ----------
                 if ms_name == "cursos":
-                    # duracion_min debe ser integer
                     if 'duracion_min' in row:
                         try:
                             row['duracion_min'] = int(row['duracion_min'])
                         except ValueError:
-                            row['duracion_min'] = 0  # fallback si hay error
+                            row['duracion_min'] = 0
 
-                    # instructor_ids debe ser array de integers
                     if 'instructor_ids' in row:
-                        # si viene como string separado por comas
-                        if isinstance(row['instructor_ids'], str):
-                            row['instructor_ids'] = [int(i.strip()) for i in row['instructor_ids'].split(',') if i.strip().isdigit()]
-                        elif isinstance(row['instructor_ids'], int):
-                            row['instructor_ids'] = [row['instructor_ids']]
-                        elif isinstance(row['instructor_ids'], list):
-                            row['instructor_ids'] = [int(i) for i in row['instructor_ids']]
-                # -------------------------------------------------------
+                        # Remplazar instructor_ids por los IDs reales
+                        instr = row['instructor_ids']
+                        instr_list = []
+                        if isinstance(instr, str):
+                            for name in instr.split(','):
+                                name = name.strip()
+                                if name in INSTRUCTORES_IDS:
+                                    instr_list.append(INSTRUCTORES_IDS[name])
+                        row['instructor_ids'] = instr_list
 
                 futures[executor.submit(post_with_retries, endpoint, row)] = row
 
@@ -111,6 +111,10 @@ def send_data_to_ms(ms_name, csv_path):
                 if result:
                     if ms_name == "students":
                         STUDENTS_IDS.append(result.get("id"))
+                    elif ms_name == "instructores":
+                        # Guardamos mapping nombre → id
+                        key = row.get("nombre") or f"id_{len(INSTRUCTORES_IDS)+1}"
+                        INSTRUCTORES_IDS[key] = result.get("id")
                     elif ms_name == "cursos":
                         CURSOS_IDS.append(result.get("id"))
 
@@ -163,9 +167,8 @@ def generate_and_send_inscripciones(n_inscripciones=20000):
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = [executor.submit(post_with_retries, MS_ENDPOINTS["inscripciones"], insc) for insc in batch]
             for future in as_completed(futures):
-                future.result()  # logs ya en post_with_retries
+                future.result()
 
-        # Barra de progreso
         print_progress(batch_num + 1, total_batches, prefix='Ingesta de inscripciones')
 
 # ---------- MAIN ----------
@@ -173,12 +176,16 @@ def generate_and_send_inscripciones(n_inscripciones=20000):
 def main():
     logging.info("===== INICIO DE INGESTA =====")
     download_csvs()
-    for ms, filename in CSV_FILES.items():
+
+    # ---------- ORDEN CORRECTO ----------
+    for ms in ["students", "instructores", "cursos"]:
+        filename = CSV_FILES[ms]
         local_path = os.path.join(LOCAL_DIR, filename)
         if os.path.exists(local_path):
             send_data_to_ms(ms, local_path)
         else:
             logging.warning(f"Saltando {ms}: {filename} no encontrado")
+
     generate_and_send_inscripciones()
     logging.info("===== INGESTA FINALIZADA =====")
     print("\n✅ Ingesta completada. Logs en:", LOG_FILE)
