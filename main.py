@@ -1,23 +1,34 @@
 import boto3
-import csv
-import os
 import requests
 import random
+import logging
+import sys
+import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-import logging
-import math
-import sys
 
 # ---------------- CONFIGURACIÓN ----------------
-BUCKET_NAME = "ingesta-microservicios-2025"
+BUCKET_NAME = "ingesta-microservicios-2025"  # bucket original
+ANALYTICS_BUCKET = "analytics-microservicios-2025"  # bucket de analytics
 REGION_NAME = "us-east-1"
 MAX_THREADS = 10
 MAX_RETRIES = 3
 LOG_FILE = "/tmp/ingesta.log"
 BATCH_SIZE = 500
-# -----------------------------------------------
+
+CSV_FILES = {
+    "students": "estudiantes.csv",
+    "instructores": "instructores.csv",
+    "cursos": "cursos.csv",
+    "inscripciones": "inscripciones.csv"
+}
+
+LOCAL_DIR = "/tmp/ingesta_data"
+import os
+os.makedirs(LOCAL_DIR, exist_ok=True)
+
+# Cliente S3
+s3 = boto3.client("s3", region_name=REGION_NAME)
 
 # Logging
 logging.basicConfig(
@@ -33,17 +44,6 @@ MS_ENDPOINTS = {
     "instructores": "http://LB-Microservicios-34846879.us-east-1.elb.amazonaws.com/instructores",
     "inscripciones": "http://LB-Microservicios-34846879.us-east-1.elb.amazonaws.com/inscripciones"
 }
-
-CSV_FILES = {
-    "students": "estudiantes.csv",   # corregido
-    "instructores": "instructores.csv",
-    "cursos": "cursos.csv",
-}
-
-LOCAL_DIR = "/tmp/ingesta_data"
-os.makedirs(LOCAL_DIR, exist_ok=True)
-
-s3 = boto3.client("s3", region_name=REGION_NAME)
 
 # ---------- FUNCIONES ----------
 
@@ -70,52 +70,6 @@ def post_with_retries(url, json_data):
             logging.error(f"Falló el envío: {json_data} | Error: {e}")
         time.sleep(0.5 * (attempt + 1))
     return None
-
-def patch_with_retries(url, json_data):
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.patch(url, json=json_data, timeout=5)
-            if response.status_code in [200, 201]:
-                logging.info(f"PATCH exitoso: {json_data} en {url}")
-                return response.json()
-            else:
-                logging.warning(f"Error {response.status_code} en PATCH: {json_data}")
-        except Exception as e:
-            logging.error(f"Falló PATCH: {json_data} | Error: {e}")
-        time.sleep(0.5 * (attempt + 1))
-    return None
-
-def send_data_to_ms(ms_name, csv_path):
-    endpoint = MS_ENDPOINTS[ms_name]
-    logging.info(f"Iniciando ingesta para {ms_name} ({endpoint})")
-
-    with open(csv_path, newline='', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = {}
-            for row in reader:
-                # ---------- Ajustes de tipo ----------
-                if ms_name == "cursos":
-                    if 'duracion_min' in row:
-                        try:
-                            row['duracion_min'] = int(row['duracion_min'])
-                        except ValueError:
-                            row['duracion_min'] = 0
-                    if 'instructor_ids' in row:
-                        instr = row['instructor_ids']
-                        instr_list = []
-                        if isinstance(instr, str):
-                            for name in instr.split(','):
-                                name = name.strip()
-                                instr_list.append(name)  # dejar tal cual, se puede patch luego
-                        row['instructor_ids'] = instr_list
-                futures[executor.submit(post_with_retries, endpoint, row)] = row
-
-            # Esperar a todos
-            for future in as_completed(futures):
-                future.result()
-
-# ---------- INSCRIPCIONES ----------
 
 def fetch_student_ids():
     """Obtiene IDs de estudiantes paginados desde el microservicio"""
@@ -189,19 +143,22 @@ def generate_and_send_inscripciones():
             future.result()
     print_progress(n_inscripciones, n_inscripciones, prefix="Ingesta de inscripciones")
 
-# ---------- PATCH cursos ----------
+# ---------- COPIA A BUCKET ANALYTICS ----------
 
-def patch_cursos_random_instructor():
-    # Obtener todos los cursos existentes
-    cursos_resp = requests.get(MS_ENDPOINTS["cursos"] + "?page=0&size=20000", timeout=5)
-    cursos_resp.raise_for_status()
-    cursos = cursos_resp.json().get("content", [])
-
-    logging.info(f"Total cursos a patch: {len(cursos)}")
-    for curso in cursos:
-        curso_id = curso["id"]
-        instructor_id = random.randint(1, 20000)
-        patch_with_retries(f"{MS_ENDPOINTS['cursos']}/{curso_id}", {"instructor_ids": [instructor_id]})
+def copy_csvs_to_analytics(source_bucket, target_bucket, csv_files):
+    today = datetime.now().strftime("%Y-%m-%d")
+    for key in csv_files.values():
+        try:
+            source_key = key
+            dest_key = f"{key.split('.')[0]}/{today}/{key}"
+            s3.copy_object(
+                Bucket=target_bucket,
+                CopySource={'Bucket': source_bucket, 'Key': source_key},
+                Key=dest_key
+            )
+            logging.info(f"{source_key} copiado a analytics como {dest_key}")
+        except Exception as e:
+            logging.error(f"No se pudo copiar {source_key} a analytics: {e}")
 
 # ---------- MAIN ----------
 
@@ -209,19 +166,20 @@ def main():
     logging.info("===== INICIO DE INGESTA =====")
     download_csvs()
 
-    for ms in ["students", "instructores", "cursos"]:
-        filename = CSV_FILES[ms]
-        local_path = os.path.join(LOCAL_DIR, filename)
-        if os.path.exists(local_path):
-            send_data_to_ms(ms, local_path)
-        else:
-            logging.warning(f"Saltando {ms}: {filename} no encontrado")
+    # ---------- COMENTADO PARA AHORRAR TIEMPO ----------
+    # for ms in ["students", "instructores", "cursos"]:
+    #     filename = CSV_FILES[ms]
+    #     local_path = os.path.join(LOCAL_DIR, filename)
+    #     if os.path.exists(local_path):
+    #         send_data_to_ms(ms, local_path)
+    #     else:
+    #         logging.warning(f"Saltando {ms}: {filename} no encontrado")
 
     # Generar inscripciones usando IDs de DB y curso aleatorio
     generate_and_send_inscripciones()
 
-    # Patch cursos con instructor_id aleatorio
-    patch_cursos_random_instructor()
+    # Copiar todos los CSV al bucket de Analytics
+    copy_csvs_to_analytics(BUCKET_NAME, ANALYTICS_BUCKET, CSV_FILES)
 
     logging.info("===== INGESTA FINALIZADA =====")
     print("\n✅ Ingesta completada. Logs en:", LOG_FILE)
