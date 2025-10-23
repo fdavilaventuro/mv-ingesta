@@ -35,7 +35,7 @@ MS_ENDPOINTS = {
 }
 
 CSV_FILES = {
-    "students": "students.csv",
+    "students": "estudiantes.csv",
     "instructores": "instructores.csv",
     "cursos": "cursos.csv",
 }
