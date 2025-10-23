@@ -2,68 +2,163 @@ import boto3
 import csv
 import os
 import requests
+import random
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import logging
+import math
+import sys
 
-# Configuración general
-BUCKET_NAME = "tu-bucket-s3-ingesta"  # ⚠️ reemplaza con tu bucket real
+# ---------------- CONFIGURACIÓN ----------------
+BUCKET_NAME = "ingesta-microservicios-2025"  # ⚠️ reemplaza con tu bucket real
 REGION_NAME = "us-east-1"
+MAX_THREADS = 10
+MAX_RETRIES = 3
+LOG_FILE = "/tmp/ingesta.log"
+BATCH_SIZE = 500
+# -----------------------------------------------
 
-# Endpoints de microservicios
+# Configuración de logging
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
 MS_ENDPOINTS = {
-    "students": "http://<IP_BALANCEADOR>/estudiantes",
-    "cursos": "http://<IP_BALANCEADOR>/cursos",
-    "inscripciones": "http://<IP_BALANCEADOR>/inscripciones",
-    "agregador": "http://<IP_BALANCEADOR>/agregador"
+    "students": "http://LB-Microservicios-34846879.us-east-1.elb.amazonaws.com/estudiantes",
+    "cursos": "http://LB-Microservicios-34846879.us-east-1.elb.amazonaws.com/cursos",
+    "instructores": "http://LB-Microservicios-34846879.us-east-1.elb.amazonaws.com/instructores",
+    "inscripciones": "http://LB-Microservicios-34846879.us-east-1.elb.amazonaws.com/inscripciones"
 }
 
-# Archivos CSV esperados en el bucket
 CSV_FILES = {
     "students": "students.csv",
     "cursos": "cursos.csv",
-    "inscripciones": "inscripciones.csv",
-    "agregador": "agregador.csv"
+    "instructores": "instructores.csv",
 }
 
-# Directorio local temporal
 LOCAL_DIR = "/tmp/ingesta_data"
 os.makedirs(LOCAL_DIR, exist_ok=True)
 
-# Cliente S3
 s3 = boto3.client("s3", region_name=REGION_NAME)
 
+# IDs retornados
+STUDENTS_IDS = []
+CURSOS_IDS = []
+
+# ---------- FUNCIONES ----------
+
 def download_csvs():
-    print(f"📥 Descargando archivos desde S3 ({BUCKET_NAME})...")
+    logging.info(f"Descargando archivos desde S3 ({BUCKET_NAME})")
     for ms, filename in CSV_FILES.items():
         local_path = os.path.join(LOCAL_DIR, filename)
         try:
             s3.download_file(BUCKET_NAME, filename, local_path)
-            print(f"✅ {filename} descargado correctamente.")
+            logging.info(f"{filename} descargado correctamente")
         except Exception as e:
-            print(f"⚠️ No se pudo descargar {filename}: {e}")
+            logging.error(f"No se pudo descargar {filename}: {e}")
+
+def post_with_retries(url, json_data):
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, json=json_data, timeout=5)
+            if response.status_code in [200, 201]:
+                logging.info(f"Registro enviado correctamente: {json_data}")
+                return response.json()
+            else:
+                logging.warning(f"Error {response.status_code} enviando: {json_data}")
+        except Exception as e:
+            logging.error(f"Falló el envío: {json_data} | Error: {e}")
+        time.sleep(0.5 * (attempt + 1))
+    return None
 
 def send_data_to_ms(ms_name, csv_path):
     endpoint = MS_ENDPOINTS[ms_name]
-    print(f"\n📤 Iniciando ingesta para {ms_name} ({endpoint})")
+    logging.info(f"Iniciando ingesta para {ms_name} ({endpoint})")
 
     with open(csv_path, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
-        for row in reader:
-            try:
-                response = requests.post(endpoint, json=row, timeout=5)
-                if response.status_code in [200, 201]:
-                    print(f"  → Registro enviado correctamente: {row}")
-                else:
-                    print(f"  ⚠️ Error {response.status_code} enviando {row}")
-            except Exception as e:
-                print(f"  ❌ Falló el envío de {row}: {e}")
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = {executor.submit(post_with_retries, endpoint, row): row for row in reader}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    if ms_name == "students":
+                        STUDENTS_IDS.append(result.get("id"))
+                    elif ms_name == "cursos":
+                        CURSOS_IDS.append(result.get("id"))
+
+def generate_inscripcion():
+    estudiante_id = random.choice(STUDENTS_IDS)
+    curso_id = random.choice(CURSOS_IDS)
+    estado = random.choice(["activa", "completada", "cancelada"])
+    metodo_pago = random.choice(["tarjeta", "paypal", "transferencia"])
+    monto = round(random.uniform(50, 500), 2)
+    total_lecciones = random.randint(5, 20)
+    lecciones_completadas = random.sample(range(1, total_lecciones+1), random.randint(0, total_lecciones))
+    progreso = {
+        "porcentaje": round(len(lecciones_completadas)/total_lecciones*100, 2),
+        "leccionesCompletadas": lecciones_completadas,
+        "ultimaLeccionId": max(lecciones_completadas) if lecciones_completadas else 0
+    }
+    fecha_inscripcion = (datetime.now() - timedelta(days=random.randint(0, 365))).isoformat()
+    return {
+        "estudianteId": estudiante_id,
+        "cursoId": curso_id,
+        "estado": estado,
+        "metodoPago": metodo_pago,
+        "monto": monto,
+        "progreso": progreso,
+        "fechaInscripcion": fecha_inscripcion
+    }
+
+def print_progress(current, total, prefix='Progreso'):
+    percent = current / total * 100
+    bar_len = 40
+    filled_len = int(bar_len * current // total)
+    bar = '=' * filled_len + '-' * (bar_len - filled_len)
+    sys.stdout.write(f'\r{prefix}: |{bar}| {percent:.1f}% ({current}/{total})')
+    sys.stdout.flush()
+    if current == total:
+        print()
+
+def generate_and_send_inscripciones(n_inscripciones=20000):
+    if not STUDENTS_IDS or not CURSOS_IDS:
+        logging.warning("No hay estudiantes o cursos válidos para generar inscripciones")
+        return
+
+    logging.info(f"Generando y enviando {n_inscripciones} inscripciones en batches de {BATCH_SIZE}")
+    total_batches = math.ceil(n_inscripciones / BATCH_SIZE)
+
+    for batch_num in range(total_batches):
+        current_batch_size = min(BATCH_SIZE, n_inscripciones - batch_num * BATCH_SIZE)
+        batch = [generate_inscripcion() for _ in range(current_batch_size)]
+
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [executor.submit(post_with_retries, MS_ENDPOINTS["inscripciones"], insc) for insc in batch]
+            for future in as_completed(futures):
+                future.result()  # logs ya en post_with_retries
+
+        # Barra de progreso
+        print_progress(batch_num + 1, total_batches, prefix='Ingesta de inscripciones')
+
+# ---------- MAIN ----------
 
 def main():
+    logging.info("===== INICIO DE INGESTA =====")
     download_csvs()
     for ms, filename in CSV_FILES.items():
         local_path = os.path.join(LOCAL_DIR, filename)
         if os.path.exists(local_path):
             send_data_to_ms(ms, local_path)
         else:
-            print(f"⚠️ Saltando {ms}: {filename} no encontrado.")
+            logging.warning(f"Saltando {ms}: {filename} no encontrado")
+    generate_and_send_inscripciones()
+    logging.info("===== INGESTA FINALIZADA =====")
+    print("\n✅ Ingesta completada. Logs en:", LOG_FILE)
 
 if __name__ == "__main__":
     main()

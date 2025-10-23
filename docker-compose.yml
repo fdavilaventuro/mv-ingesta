@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  ingesta-ms:
+    image: ingesta-ms-light:latest # nombre de tu imagen Docker
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ingesta-ms
+    volumes:
+      - ~/.aws:/root/.aws:ro # montamos las credenciales AWS de tu MV
+    environment:
+      - AWS_REGION=us-east-1
+    restart: "no" # no reiniciar automáticamente
