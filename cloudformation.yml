@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Crea la instancia EC2 para la MV de Ingesta con Docker y acceso a S3.
+  Usa la misma AMI base que las otras MVs (ami-08d434e92c0cfa0c0).
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Nombre del par de llaves para acceder por SSH a la instancia.
+
+Resources:
+  IngestaInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-08d434e92c0cfa0c0
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref SGProd
+      Tags:
+        - Key: Name
+          Value: MV Ingesta
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 10
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker git python3
+          systemctl enable docker
+          systemctl start docker
+          echo "Instancia MV Ingesta lista con Docker y Python3"
+
+  SGProd:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Grupo de seguridad compartido entre las MVs de producción
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # SSH (ajústalo si quieres restringirlo)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8010
+          ToPort: 8010
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: SG Prod
+
+  ElasticIPIngesta:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref IngestaInstance
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: EIP MV Ingesta
+
+Outputs:
+  IngestaInstanceId:
+    Description: ID de la instancia creada para la MV Ingesta
+    Value: !Ref IngestaInstance
+
+  IngestaPublicIP:
+    Description: Dirección IP pública (EIP) asignada a la MV Ingesta
+    Value: !Ref ElasticIPIngesta
+
+  IngestaPrivateIP:
+    Description: IP privada de la MV Ingesta
+    Value: !GetAtt IngestaInstance.PrivateIp
+
+  SecurityGroupId:
+    Description: ID del grupo de seguridad compartido SG Prod
+    Value: !Ref SGProd
